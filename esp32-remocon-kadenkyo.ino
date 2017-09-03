@@ -14,6 +14,11 @@
 #define SW_PIN 19
 #define IRM_PIN 34
 
+// +-20% の範囲内かどうかを調べるマクロ
+#define WITHIN_RANGE(t, n) ((n)*0.8 <= (t) && (t) <= (n) * 1.2)
+// +-20% の以上かどうかを調べるマクロ
+#define OVER_RANGE(t, n) ((t) <= (n) * 1.2)
+
 
 // Arduino like analogWrite
 // value has to be between 0 and valueMax
@@ -45,10 +50,21 @@ void putLed(uint8_t v) {
 }
 
 
+#define FMT_UNKNOWN 0
+#define FMT_NEC 1
+#define FMT_KADENKYO 2
+#define FMT_SONY 3
+
 
 uint8_t state = 0; // 0:idle, 1:send IR, 2:read IR
 int counter = 0;
-
+uint8_t readByte;
+uint8_t readPos = 0;
+uint8_t remoconData[64];
+uint8_t remoconDataLen = 0;
+uint8_t format = 0; // 0:unknown 1:nec 2:kadenkyo 3:sony
+unsigned long sumTime;
+unsigned long sumT = 0;
 
 void loop() {
 
@@ -144,33 +160,49 @@ bool sendIR() {
 
 
 bool readIR() {
-  static uint8_t readState = 0; // 0:initial 1:reading leader 2:reading data
+  static uint8_t readState = 0; // 0:initial 1:reading leader 2:reading data 9:wait 100msec
   static uint8_t hilo;
   static unsigned long prevTime;
   static unsigned long leader[2];
-  static uint8_t format = 0; // 0:unknown 1:nec 2:kadenkyo 3:sony
-  unsigned long t;
+  unsigned long t,diff;
 
   if (readState == 0) {
     prevTime = micros();
     readState = 1;
     hilo = LOW;
+    readPos = 0;
+    readByte = 0;
+    remoconDataLen = 0;
+    sumTime = 0;
+    sumT = 0;
   } else if (readState == 1) {
     if (digitalRead(IRM_PIN) != hilo) {
       t = micros();
+      diff = t - prevTime;
       if (hilo == LOW) {
-        leader[0] = t - prevTime;
+        leader[0] = diff;
       } else {
-        leader[1] = t - prevTime;
+        leader[1] = diff;
         format = parseLeader(leader);
-        readState = 2;
+        readState = (format == FMT_UNKNOWN ? 9 : 2);
       }
       hilo = !hilo;
       prevTime = t;
     }
   } else if (readState == 2) {
+    if (digitalRead(IRM_PIN) != hilo) {
+      t = micros();
+      diff = t - prevTime;
+      uint8_t ret = parseData(hilo, diff, format);
+      if (ret == -1) {
+        readState = 9;
+      } else if (ret == 0) {
+        readState = 3;
+      }
+    }
+  } else if (readState == 9) {
     t = micros();
-    if (t - prevTime > 500000) {
+    if (t - prevTime > 200000) {
       readState = 0;
       return true;
     }
@@ -187,18 +219,85 @@ uint8_t parseLeader(unsigned long *leader) {
   #define TNEC 562
   #define TKADENKYO 425
   #define TSONY 600
-  if (16 * TNEC * 0.8 <= leader[0] && leader[0] <= 16 * TNEC * 1.2 &&
-       8 * TNEC * 0.8 <= leader[1] && leader[1] <=  8 * TNEC * 1.2) {
+  if (WITHIN_RANGE(leader[0], 16 * TNEC) && WITHIN_RANGE(leader[1], 8 * TNEC)) {
     Serial.print("NEC => ");
-  } else if (8 * TKADENKYO * 0.8 <= leader[0] && leader[0] <= 8 * TKADENKYO * 1.2 &&
-             4 * TKADENKYO * 0.8 <= leader[1] && leader[1] <= 4 * TKADENKYO * 1.2) {
+    return FMT_NEC;
+  } else if (WITHIN_RANGE(leader[0], 8 * TKADENKYO) &&
+             WITHIN_RANGE(leader[1], 4 * TKADENKYO)) {
     Serial.print("KADENKYO => ");
-  } else if (4 * TSONY * 0.8 <= leader[0] && leader[0] <= 4 * TSONY * 1.2 &&
-             1 * TSONY * 0.8 <= leader[1] && leader[1] <= 1 * TSONY * 1.2) {
+    return FMT_KADENKYO;
+  } else if (WITHIN_RANGE(leader[0], 4 * TSONY) &&
+             WITHIN_RANGE(leader[1], 1 * TSONY)) {
     Serial.print("SONY => ");
+    return FMT_SONY;
   }
   Serial.print(leader[0]);
   Serial.print(",");
   Serial.print(leader[1]);
   Serial.println();
+  return FMT_UNKNOWN;
+}
+
+/**
+ * @return -1:error 0:keep reading 1:end
+ */
+uint8_t parseData(uint8_t hilo, unsigned long time, uint8_t format) {
+  uint8_t bit = 0xff;
+  if (format == FMT_SONY) {
+    // TODO:
+    if (hilo == LOW) {
+      if (WITHIN_RANGE(time, 1 * TSONY)) {
+      } else if (WITHIN_RANGE(time, 2 * TSONY)) {
+        readByte |= (1 << (7-readPos));
+      } else {
+        return -1;
+      }
+      readPos++;
+    } else {
+      if (!WITHIN_RANGE(time, 1 * TSONY)) {
+        return -1;
+      }
+    }
+  } else if (format == FMT_NEC) {
+    if (hilo == LOW) {
+      if (!WITHIN_RANGE(time, 1 * TNEC)) {
+        return -1;
+      }
+      return 0;
+    } else {
+      if (WITHIN_RANGE(time, 1 * TNEC)) {
+      } else if (WITHIN_RANGE(time, 3 * TNEC)) {
+        readByte |= (1 << (7-readPos));
+      } else if (OVER_RANGE(time, 3 * TNEC)) {
+        if (readPos == 0)
+          return 1;
+        else
+          return -1;
+      }
+    }
+  } else if (format == FMT_KADENKYO) {
+    if (hilo == LOW) {
+      if (!WITHIN_RANGE(time, 1 * TKADENKYO)) {
+        return -1;
+      }
+      return 0;
+    } else {
+      if (WITHIN_RANGE(time, 1 * TKADENKYO)) {
+      } else if (WITHIN_RANGE(time, 3 * TKADENKYO)) {
+        readByte |= (1 << (7-readPos));
+      } else if (OVER_RANGE(time, 3 * TKADENKYO)) {
+        if (readPos == 0)
+          return 1;
+        else
+          return -1;
+      }
+    }
+  }
+  readPos++;
+  if (readPos == 8) {
+    remoconData[remoconDataLen++] = readByte;
+    readByte = 0;
+    readPos = 0;
+  }
+  return 0;
 }
